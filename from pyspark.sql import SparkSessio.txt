@@ -1,0 +1,118 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when, median
+from pyspark.sql.types import DoubleType
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.classification import NaiveBayes
+from pyspark.ml import Pipeline
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Project54_EnergyAnalyticsNaiveBayes") \
+    .getOrCreate()
+
+# --- 1. Acquire and prepare the energy dataset, removing nulls and inconsistencies. ---
+
+# Define the file path
+file_path = "World Energy Consumption.csv"
+
+# Load the data, inferring schema
+df = spark.read.csv(file_path, header=True, inferSchema=True)
+
+# Define relevant columns (Features and Target)
+# CORRECTED: Changed 'renewable_consumption' to 'renewables_consumption'
+feature_cols = [
+    "population",
+    "gdp",
+    "fossil_fuel_consumption",
+    "renewables_consumption",
+    "energy_per_gdp"
+]
+target_col = "energy_per_capita"
+all_cols = feature_cols + [target_col]
+
+# Cast selected columns to DoubleType and handle potential non-numeric data by coercing to null
+for c in all_cols:
+    df = df.withColumn(c, col(c).cast(DoubleType()))
+
+# Remove nulls in the selected columns
+df_clean = df.select(all_cols).na.drop()
+
+# --- 2. Conduct statistical and visual exploration to identify useful insights (Preparation for Modeling) ---
+
+# Calculate the median for the target variable to create a binary classification problem
+try:
+    median_val = df_clean.agg(median(target_col).alias("median_val")).collect()[0]["median_val"]
+except:
+    print("Could not calculate median. Check if data remains after cleaning.")
+    spark.stop()
+    exit(1)
+
+# Feature Engineering: Create the binary target variable 'consumption_level' (label)
+# 1.0 for High energy per capita (>= median), 0.0 for Low (< median)
+df_model = df_clean.withColumn(
+    "label",
+    when(col(target_col) >= median_val, 1.0).otherwise(0.0)
+)
+
+# Split data into training and test sets (80/20 split)
+(training_data, test_data) = df_model.randomSplit([0.8, 0.2], seed=42)
+
+# --- 3. Apply Naive Bayes to model and understand key relationships within the dataset. ---
+
+# 3.1. Vector Assembler: Combine features into a single vector
+assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+
+# 3.2. Naive Bayes Classifier (using Gaussian model type for continuous features)
+nb = NaiveBayes(featuresCol="features", labelCol="label", modelType="gaussian")
+
+# 3.3. Pipeline: Define the sequence of transformations and the model
+pipeline = Pipeline(stages=[assembler, nb])
+
+# --- 4. Adjust parameters and test different configurations to enhance model accuracy. ---
+
+# Create ParamGrid for Cross-Validation (tuning the 'smoothing' parameter)
+paramGrid = ParamGridBuilder() \
+    .addGrid(nb.smoothing, [0.0, 0.1, 0.5, 1.0]) \
+    .build()
+
+# Create MulticlassClassificationEvaluator
+evaluator = MulticlassClassificationEvaluator(
+    labelCol="label",
+    predictionCol="prediction",
+    metricName="accuracy"
+)
+
+# Create CrossValidator (5-fold cross-validation)
+cv = CrossValidator(
+    estimator=pipeline,
+    estimatorParamMaps=paramGrid,
+    evaluator=evaluator,
+    numFolds=5,
+    seed=42
+)
+
+# Fit the CrossValidator model
+print("Fitting CrossValidator model...")
+cv_model = cv.fit(training_data)
+best_model = cv_model.bestModel
+print("--- Best Model Found ---")
+print(f"Best Smoothing Parameter: {best_model.stages[-1].getSmoothing()}")
+
+# --- 5. Generate visual summaries and plots to interpret the results effectively. ---
+
+# Make predictions on the test data
+predictions = cv_model.transform(test_data)
+
+# Calculate and print metrics
+accuracy = evaluator.evaluate(predictions)
+print(f"Test Set Accuracy: {accuracy:.4f}")
+
+# Generate a simplified confusion matrix (counts)
+confusion_matrix = predictions.groupBy("label").pivot("prediction").count().fillna(0)
+print("\n--- Confusion Matrix (Actual vs Predicted) ---")
+confusion_matrix.show()
+
+# --- Clean up ---
+spark.stop()
